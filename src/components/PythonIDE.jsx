@@ -6,65 +6,62 @@ import dynamic from 'next/dynamic';
 /* -------------------------------------------------
  *  Monaco loads only on the client (avoids SSR issues)
  * ------------------------------------------------- */
-const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
+const MonacoEditor = dynamic(
+  () => import('@monaco-editor/react'),
+  { ssr: false }
+);
 
 export default function PythonIDE() {
-  /* refs & state */
-  const editorRef        = useRef(null);
-  const [pyodide, setPyodide] = useState(null);
-  const [output,  setOutput]  = useState('');
-  const [busy,    setBusy]    = useState(false);
+  const editorRef = useRef(null);
+  const [output, setOutput] = useState('');
+  const [busy, setBusy] = useState(false);
 
   /* -------------------------------------------------
-   *  Load Pyodide once via <script> tag (works with Webpack & Turbopack)
+   *  Load Pyodide into Worker (preload)
    * ------------------------------------------------- */
   useEffect(() => {
-    let cancelled = false;
-
-    async function bootPyodide() {
-      /* if the script is already present (hot-reload) just reuse it */
-      if (window.loadPyodide) {
-        const py = await window.loadPyodide({
-          stdout: (msg) => setOutput((o) => o + msg),
-          stderr: (msg) => setOutput((o) => o + msg),
-        });
-        if (!cancelled) setPyodide(py);
-        return;
-      }
-
-      /* inject the script */
-      const script = document.createElement('script');
-      script.src   = 'https://cdn.jsdelivr.net/pyodide/v0.28.0/full/pyodide.js';
-      script.onload = async () => {
-        const py = await window.loadPyodide({
-          stdout: (msg) => setOutput((o) => o + msg),
-          stderr: (msg) => setOutput((o) => o + msg),
-        });
-        if (!cancelled) setPyodide(py);
-      };
-      document.body.appendChild(script);
-    }
-
-    bootPyodide();
-    return () => { cancelled = true; };
+    // Pre-fetch the worker script so it’s cached by the browser.
+    fetch('/pyodideWorker.js');
   }, []);
 
   /* -------------------------------------------------
-   *  Run button handler
+   *  Run button handler with true TLE via Worker
    * ------------------------------------------------- */
-  const runCode = async () => {
-    if (!pyodide) return;
+  const runCode = () => {
+    const code = editorRef.current?.getValue() ?? '';
     setBusy(true);
     setOutput('▶️ Running Python code…\n');
-    const code = editorRef.current?.getValue() ?? '';
-    try {
-      await pyodide.loadPackagesFromImports(code);
-      await pyodide.runPythonAsync(code);
-    } catch (err) {
-      setOutput((o) => o + `❌ ${err}\n`);
-    } finally {
+
+    // 1️⃣  Spawn a new worker per run
+    const worker = new Worker('/pyodideWorker.js');
+
+    // 2️⃣  Enforce a 2 000 ms limit
+    const timer = setTimeout(() => {
+      worker.terminate();
+      setOutput((o) => o + '⏱ Time limit exceeded\n');
       setBusy(false);
-    }
+    }, 10000);
+
+    // 3️⃣  Handle messages from worker
+    worker.onmessage = (e) => {
+      clearTimeout(timer);
+      const { type, msg, result, error } = e.data;
+
+      if (type === 'stdout' || type === 'stderr') {
+        setOutput((o) => o + msg);
+      } else if (type === 'done') {
+        setOutput((o) => o + result + '\n');
+        setBusy(false);
+        worker.terminate();
+      } else if (type === 'error') {
+        setOutput((o) => o + '❌ ' + error + '\n');
+        setBusy(false);
+        worker.terminate();
+      }
+    };
+
+    // 4️⃣  Kick off execution
+    worker.postMessage({ code });
   };
 
   /* -------------------------------------------------
@@ -72,7 +69,7 @@ export default function PythonIDE() {
    * ------------------------------------------------- */
   return (
     <div style={{ display: 'flex', height: 'calc(100vh - 4rem)' }}>
-      {/* editor pane */}
+      {/* Editor pane */}
       <div style={{ flex: 1 }}>
         <MonacoEditor
           height="100%"
@@ -84,7 +81,7 @@ export default function PythonIDE() {
         />
       </div>
 
-      {/* console pane */}
+      {/* Console pane */}
       <div
         style={{
           width: '32%',
@@ -96,7 +93,7 @@ export default function PythonIDE() {
       >
         <div style={{ padding: '0.5rem', borderBottom: '1px solid #333' }}>
           <button
-            disabled={!pyodide || busy}
+            disabled={busy}
             onClick={runCode}
             style={{
               padding: '0.4rem 0.8rem',
@@ -104,7 +101,7 @@ export default function PythonIDE() {
               background: '#0d6efd',
               color: '#fff',
               border: 'none',
-              cursor: 'pointer',
+              cursor: busy ? 'default' : 'pointer',
               opacity: busy ? 0.6 : 1,
             }}
           >
@@ -124,7 +121,6 @@ export default function PythonIDE() {
             Clear
           </button>
         </div>
-
         <pre
           style={{
             flex: 1,
