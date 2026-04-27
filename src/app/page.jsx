@@ -1,6 +1,6 @@
 'use client';
-import PythonIDE from '@/components/PythonIDE';
+import Playground from '@/components/Playground';
 
 export default function HomePage() {
-  return <PythonIDE />;
+  return <Playground />;
 }

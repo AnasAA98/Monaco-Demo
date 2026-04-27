@@ -9,6 +9,14 @@ const compat = new FlatCompat({
   baseDirectory: __dirname,
 });
 
-const eslintConfig = [...compat.extends("next/core-web-vitals")];
+const eslintConfig = [
+  ...compat.extends("next/core-web-vitals"),
+  {
+    rules: {
+      // Google Fonts loaded via <link> in app-router root layout is fine.
+      "@next/next/no-page-custom-font": "off",
+    },
+  },
+];
 
 export default eslintConfig;
