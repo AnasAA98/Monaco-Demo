@@ -32,6 +32,86 @@ const ANIMAL_NAMES = [
   'Lynx', 'Badger', 'Sparrow', 'Newt', 'Wombat',
 ];
 
+function hexToRgba(hex, alpha) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || '');
+  if (!m) return `rgba(99,102,241,${alpha})`;
+  const r = parseInt(m[1], 16);
+  const g = parseInt(m[2], 16);
+  const b = parseInt(m[3], 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// Deterministic color from clientId so two peers can never collide on color.
+function colorForClientId(clientId) {
+  const palette = PEER_COLORS;
+  let hash = 0;
+  const s = String(clientId);
+  for (let i = 0; i < s.length; i++) hash = (hash * 31 + s.charCodeAt(i)) >>> 0;
+  return palette[hash % palette.length];
+}
+
+// Pick a label text color (white vs near-black) for legibility against the
+// peer color. Uses relative luminance per WCAG.
+function readableTextColor(hex) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || '');
+  if (!m) return '#fff';
+  const toLin = (v) => {
+    const c = parseInt(v, 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  const L = 0.2126 * toLin(m[1]) + 0.7152 * toLin(m[2]) + 0.0722 * toLin(m[3]);
+  return L > 0.55 ? '#0a0c10' : '#fff';
+}
+
+// Inject (or refresh) a per-peer style block exposing CSS custom properties
+// that scope to that peer's classes (.peer-sel/.peer-caret/.peer-flash with
+// the peer's clientId as a suffix).
+function applyPeerColorVars(clientId, color, fg) {
+  const id = `peer-vars-${clientId}`;
+  let tag = document.getElementById(id);
+  if (!tag) {
+    tag = document.createElement('style');
+    tag.id = id;
+    document.head.appendChild(tag);
+  }
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(color);
+  const r = m ? parseInt(m[1], 16) : 99;
+  const g = m ? parseInt(m[2], 16) : 102;
+  const b = m ? parseInt(m[3], 16) : 241;
+  // Slight tweaks per state. Selection uses 22% alpha; flash uses 30%.
+  const tag_css =
+    `.peer-sel-${clientId} { background-color: rgba(${r},${g},${b},0.22) !important; }\n` +
+    `.peer-caret-${clientId} { background: ${color} !important; }\n` +
+    `.peer-flash-${clientId} { background-color: rgba(${r},${g},${b},0.30) !important; transition: background-color 1.4s ease-out; }\n` +
+    `.peer-flash-line-${clientId} { background-color: rgba(${r},${g},${b},0.08) !important; }`;
+  tag.textContent = tag_css;
+}
+
+// Build a Monaco content widget that anchors above (or below) the peer's
+// caret. Monaco handles viewport-edge positioning via the preference array.
+function createLabelWidget(clientId) {
+  const dom = document.createElement('div');
+  dom.className = 'peer-label';
+  dom.dataset.peer = String(clientId);
+  // The widget object we store its position on; .__pos is read from the
+  // closure in renderPresence.
+  const widget = {
+    __pos: { line: 1, col: 1, below: false },
+    getId: () => `peer-label-${clientId}`,
+    getDomNode: () => dom,
+    getPosition: () => {
+      // Use the local Monaco we passed in (referenced via window.monaco at
+      // dispatch time isn't available; fall back to numeric constants for
+      // ContentWidgetPositionPreference: ABOVE=1, BELOW=2, EXACT=0).
+      return {
+        position: { lineNumber: widget.__pos.line, column: widget.__pos.col },
+        preference: widget.__pos.below ? [2, 1] : [1, 2],
+      };
+    },
+  };
+  return widget;
+}
+
 const SANDBOX_HTML = `<!doctype html>
 <html><head><meta charset="utf-8" /></head><body>
 <script>
@@ -158,6 +238,7 @@ export default function Playground() {
   // Per-language active file id
   const [pyActive, setPyActive] = useState(null);
   const [jsActive, setJsActive] = useState(null);
+  const [editorReady, setEditorReady] = useState(false);
 
   // Refs
   const editorRef = useRef(null);
@@ -169,6 +250,16 @@ export default function Playground() {
   const busyRef = useRef(false);
   const iframeRef = useRef(null);
   const runIdRef = useRef(0);
+
+  // Remote-presence refs — declared up here because the doc-swap effect needs
+  // to tear them down BEFORE disposing models, and the presence renderer
+  // effect (further down) populates them.
+  const peerWidgetsRef = useRef(new Map());
+  const peerDecosRef = useRef(new Map());
+  const peerLastSeenRef = useRef(new Map());
+  const peerLeavingRef = useRef(new Map());
+  const idleTickRef = useRef(null);
+  const flashHandlesRef = useRef(new Map());
 
   // Hydrate identity / room on mount (client only)
   useEffect(() => {
@@ -224,7 +315,28 @@ export default function Playground() {
   }, [userColor, hydrated]);
 
   const collab = useCollab({ enabled: collabEnabled, roomId, userName, userColor });
-  const { status, peers, version, getTabs, addTab, renameTab, closeTab, getText } = collab;
+  const {
+    status, peers, version, getTabs, addTab, renameTab, closeTab, getText,
+    isHost, terminated, endSession,
+  } = collab;
+
+  // When the host ends the session, every peer drops collab. The host keeps
+  // the work (snapshot already written to localStorage by endSession()) and
+  // lands on / in solo mode. Non-host peers also land on / in solo mode but
+  // see only their own pre-collab files (their solo storage was untouched).
+  const wasHostRef = useRef(false);
+  useEffect(() => { wasHostRef.current = isHost; }, [isHost]);
+  useEffect(() => {
+    if (terminated && collabEnabled) {
+      const wasHost = wasHostRef.current;
+      setCollabEnabled(false);
+      // Generate a fresh room id so re-enabling collab doesn't drop us right
+      // back into the terminated room.
+      setRoomId(Math.random().toString(36).slice(2, 8));
+      setShareToast(wasHost ? 'Session ended' : 'Session was ended by host');
+      setTimeout(() => setShareToast(''), 2400);
+    }
+  }, [terminated, collabEnabled]);
 
   // Snapshot tabs for the current language; recomputed when the underlying
   // store (Yjs in collab mode, local Y.Doc in solo mode) notifies us.
@@ -311,7 +423,8 @@ export default function Playground() {
   }, [appendOutput, cleanupRun]);
 
   // ---------- Monaco models bound to Y.Text ----------
-  const docKey = collab.doc; // identity changes when we switch modes
+  const docKey = collab.doc;            // changes when we switch modes
+  const awarenessKey = collab.awareness; // changes when collab connects/disconnects
   const ensureModelAndBinding = useCallback(
     (id, monacoLang) => {
       const monaco = monacoRef.current;
@@ -325,47 +438,58 @@ export default function Playground() {
         model = monaco.editor.createModel('', monacoLang, uri);
         modelsRef.current.set(id, model);
       }
+      // Recreate the binding whenever the underlying doc OR the awareness ref
+      // changes. The binding caches both at construction time, so a stale ref
+      // means cursors and edits stop syncing for that file.
       const existing = bindingsRef.current.get(id);
-      if (existing && existing.__doc !== docKey) {
+      if (
+        existing &&
+        (existing.__doc !== docKey || existing.__awareness !== awarenessKey)
+      ) {
         existing.destroy();
         bindingsRef.current.delete(id);
       }
       if (!bindingsRef.current.has(id)) {
-        const binding = new MonacoBinding(
-          ytext,
-          model,
-          new Set(),
-          collab.awareness ?? null
-        );
+        // Pass null for awareness — we render remote presence ourselves
+        // (carets as decorations, name labels as content widgets) so we get
+        // viewport-aware positioning, idle fades, and stack-avoidance.
+        const binding = new MonacoBinding(ytext, model, new Set(), null);
         binding.__doc = docKey;
+        binding.__awareness = awarenessKey;
         bindingsRef.current.set(id, binding);
-      } else {
-        const binding = bindingsRef.current.get(id);
-        if (editorRef.current) binding.editors.add(editorRef.current);
       }
       return model;
     },
-    [getText, collab.awareness, docKey]
+    [getText, awarenessKey, docKey]
   );
 
   // Switch the editor to the active file's model + binding.
+  // Runs whenever the active id, language, or doc identity changes — and on
+  // first editor mount once tabs have arrived.
   useEffect(() => {
     const editor = editorRef.current;
-    if (!editor || !monacoRef.current || !activeId) return;
+    const monaco = monacoRef.current;
+    if (!editor || !monaco || !activeId) return;
     const monacoLang = LANG_META[lang].monacoLang;
     const model = ensureModelAndBinding(activeId, monacoLang);
     if (!model) return;
+
+    // Make sure the model's language matches the current pane (a model created
+    // via the JS pane that is later viewed under Python — or after a Yjs
+    // doc swap — would otherwise keep its old language).
+    if (model.getLanguageId && model.getLanguageId() !== monacoLang) {
+      monaco.editor.setModelLanguage(model, monacoLang);
+    }
+
+    bindingsRef.current.forEach((b, id) => {
+      if (id !== activeId) b.editors.delete(editor);
+    });
     if (editor.getModel() !== model) {
-      // Detach the editor from any previously bound model so its remote-cursor
-      // decorations stop targeting the old buffer.
-      bindingsRef.current.forEach((b, id) => {
-        if (id !== activeId) b.editors.delete(editor);
-      });
       editor.setModel(model);
-      bindingsRef.current.get(activeId)?.editors.add(editor);
       editor.focus();
     }
-  }, [lang, activeId, ensureModelAndBinding]);
+    bindingsRef.current.get(activeId)?.editors.add(editor);
+  }, [lang, activeId, ensureModelAndBinding, editorReady]);
 
   // Dispose models + bindings for files that were removed by any peer.
   useEffect(() => {
@@ -386,16 +510,342 @@ export default function Playground() {
 
   // When the underlying doc swaps (collab toggled on/off), tear down every
   // binding so the next render re-binds against the new doc's Y.Text.
+  // Order matters here — Monaco throws "Canceled" if a decoration update is
+  // queued against a model we're about to dispose. So we must:
+  //   1. clear all decoration collections + remove all widgets,
+  //   2. detach the editor from any model,
+  //   3. destroy the y-monaco bindings,
+  //   4. dispose the models.
   useEffect(() => {
-    for (const binding of bindingsRef.current.values()) binding.destroy();
+    const editor = editorRef.current;
+    // 1. Decorations and widgets first.
+    for (const c of peerDecosRef.current.values()) c.clear();
+    peerDecosRef.current.clear();
+    for (const widget of peerWidgetsRef.current.values()) {
+      try { editor?.removeContentWidget?.(widget); } catch {}
+    }
+    peerWidgetsRef.current.clear();
+    for (const { collection, timer } of flashHandlesRef.current.values()) {
+      clearTimeout(timer);
+      try { collection.clear(); } catch {}
+    }
+    flashHandlesRef.current.clear();
+    for (const { timer } of peerLeavingRef.current.values()) clearTimeout(timer);
+    peerLeavingRef.current.clear();
+
+    // 2. Detach the editor from any model so its in-flight events don't
+    //    target a freshly disposed buffer.
+    try { editor?.setModel?.(null); } catch {}
+
+    // 3. Destroy bindings (these unsubscribe from the Y.Text + the model).
+    for (const binding of bindingsRef.current.values()) {
+      try { binding.destroy(); } catch {}
+    }
     bindingsRef.current.clear();
-    for (const model of modelsRef.current.values()) model.dispose();
+
+    // 4. Finally dispose the models.
+    for (const model of modelsRef.current.values()) {
+      try { model.dispose(); } catch {}
+    }
     modelsRef.current.clear();
-    // Force the active-id effect to re-run by nudging both ids; the sanity
-    // effect will reconcile to the first available tab.
+
     setPyActive(null);
     setJsActive(null);
   }, [docKey]);
+
+  // ---------- Remote presence: caret + selection + label widgets ----------
+  // We render remote presence ourselves (we passed null to MonacoBinding's
+  // awareness arg) so we can:
+  //  • position labels with viewport-edge awareness (Monaco content widgets)
+  //  • fade idle labels independently of carets
+  //  • stack labels when peers share a line
+  //  • per-peer color comes from a CSS variable so styling lives in one place
+
+  // Publish our own cursor/selection into awareness on every editor change.
+  useEffect(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const awareness = collab.awareness;
+    if (!editor || !monaco || !awareness || !editorReady) return;
+
+    const writeSelection = () => {
+      const model = editor.getModel();
+      if (!model || !activeId) return;
+      const sel = editor.getSelection();
+      if (!sel) return;
+      awareness.setLocalStateField('presence', {
+        fileId: activeId,
+        anchorLine: sel.startLineNumber,
+        anchorCol: sel.startColumn,
+        headLine: sel.endLineNumber,
+        headCol: sel.endColumn,
+        // Reverse the head/anchor when the user selects backwards so we draw
+        // the caret on the correct end of the selection.
+        reversed: sel.getDirection() === monaco.SelectionDirection.RTL,
+        ts: Date.now(),
+      });
+    };
+
+    const d1 = editor.onDidChangeCursorSelection(writeSelection);
+    const d2 = editor.onDidChangeCursorPosition(writeSelection);
+    writeSelection();
+
+    return () => {
+      d1.dispose();
+      d2.dispose();
+      // Clear our presence from awareness so peers see us "leave" this file.
+      awareness.setLocalStateField('presence', null);
+    };
+  }, [collab.awareness, activeId, editorReady]);
+
+  // Render every other peer's presence as decorations + content widgets.
+  useEffect(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const awareness = collab.awareness;
+    if (!editor || !monaco || !awareness || !editorReady) return;
+
+    const localClientId = awareness.clientID;
+
+    // Rebuild presence on every awareness change. Cheap because we diff and
+    // only touch widgets/decos for peers whose state actually changed.
+    const renderPresence = () => {
+      const states = awareness.getStates();
+      const present = new Set();
+
+      // Group by line so we know which labels need stacking offsets.
+      const byLine = new Map();
+      const peersOnFile = [];
+      for (const [cid, state] of states.entries()) {
+        if (cid === localClientId) continue;
+        const p = state?.presence;
+        if (!p || p.fileId !== activeId) continue;
+        peersOnFile.push({ cid, p });
+        const arr = byLine.get(p.headLine) || [];
+        arr.push(cid);
+        byLine.set(p.headLine, arr);
+      }
+
+      const model = editor.getModel();
+      if (!model) return;
+      const lineCount = model.getLineCount();
+
+      for (const { cid, p } of peersOnFile) {
+        present.add(cid);
+        peerLastSeenRef.current.set(cid, p.ts || Date.now());
+        // Cancel any pending leave-fade if the peer reappeared.
+        const leaving = peerLeavingRef.current.get(cid);
+        if (leaving) {
+          clearTimeout(leaving.timer);
+          peerLeavingRef.current.delete(cid);
+        }
+
+        const peerName =
+          (states.get(cid)?.user?.name || 'peer').slice(0, 24);
+        const color = colorForClientId(cid);
+        const fg = readableTextColor(color);
+
+        // Clamp the position to a real model location.
+        const safeLine = Math.max(1, Math.min(lineCount, p.headLine || 1));
+        const maxCol = model.getLineMaxColumn(safeLine);
+        const safeCol = Math.max(1, Math.min(maxCol, p.headCol || 1));
+        const aLine = Math.max(1, Math.min(lineCount, p.anchorLine || safeLine));
+        const aMaxCol = model.getLineMaxColumn(aLine);
+        const aCol = Math.max(1, Math.min(aMaxCol, p.anchorCol || safeCol));
+
+        // Build decorations: selection range + caret zero-width range.
+        const selRange = new monaco.Range(
+          Math.min(aLine, safeLine),
+          Math.min(aLine === safeLine ? aCol : aCol, aLine < safeLine ? aCol : safeCol),
+          Math.max(aLine, safeLine),
+          Math.max(aLine === safeLine ? safeCol : safeCol, aLine > safeLine ? aCol : safeCol),
+        );
+        const caretRange = new monaco.Range(safeLine, safeCol, safeLine, safeCol);
+
+        const decos = [];
+        if (!selRange.isEmpty()) {
+          decos.push({
+            range: selRange,
+            options: { className: `peer-sel peer-sel-${cid}`, stickiness: 1 },
+          });
+        }
+        decos.push({
+          range: caretRange,
+          options: {
+            className: `peer-caret peer-caret-${cid}`,
+            beforeContentClassName: `peer-caret peer-caret-${cid}`,
+            stickiness: 1,
+          },
+        });
+
+        let collection = peerDecosRef.current.get(cid);
+        if (!collection) {
+          collection = editor.createDecorationsCollection([]);
+          peerDecosRef.current.set(cid, collection);
+        }
+        collection.set(decos);
+
+        // Apply per-peer color via inline CSS variable on the editor's
+        // overlay container. Decorations don't take inline style directly,
+        // so we use a dedicated <style> tag keyed by clientId scoped to
+        // .peer-* classes carrying that peer's id via attribute selector...
+        // Simplest reliable path: set a per-peer style block.
+        applyPeerColorVars(cid, color, fg);
+
+        // Build / update the name label widget.
+        let widget = peerWidgetsRef.current.get(cid);
+        if (!widget) {
+          widget = createLabelWidget(cid);
+          editor.addContentWidget(widget);
+          peerWidgetsRef.current.set(cid, widget);
+        }
+        const stackIndex = (byLine.get(safeLine) || []).indexOf(cid);
+        const labelDom = widget.getDomNode();
+        labelDom.textContent = peerName;
+        labelDom.style.setProperty('--peer-color', color);
+        labelDom.style.setProperty('--peer-fg', fg);
+        labelDom.classList.toggle('peer-label-below', safeLine <= 1);
+        labelDom.classList.toggle('peer-label-stack-1', stackIndex === 1);
+        labelDom.classList.toggle('peer-label-stack-2', stackIndex >= 2);
+        labelDom.classList.remove('peer-label-leaving');
+        // Idle detection toggles peer-label-idle in the tick below.
+        widget.__pos = {
+          line: safeLine,
+          col: safeCol,
+          below: safeLine <= 1,
+        };
+        editor.layoutContentWidget(widget);
+      }
+
+      // Fade out peers who left the file or disconnected.
+      for (const [cid, widget] of peerWidgetsRef.current.entries()) {
+        if (present.has(cid)) continue;
+        if (peerLeavingRef.current.has(cid)) continue;
+        const dom = widget.getDomNode();
+        dom.classList.add('peer-label-leaving');
+        const timer = setTimeout(() => {
+          editor.removeContentWidget(widget);
+          peerWidgetsRef.current.delete(cid);
+          const c = peerDecosRef.current.get(cid);
+          if (c) {
+            c.clear();
+            peerDecosRef.current.delete(cid);
+          }
+          peerLeavingRef.current.delete(cid);
+        }, 220);
+        peerLeavingRef.current.set(cid, { timer });
+      }
+    };
+
+    const onChange = () => renderPresence();
+    awareness.on('change', onChange);
+    renderPresence();
+
+    // Idle tick: fade labels that haven't moved in 3s.
+    const tick = () => {
+      const now = Date.now();
+      for (const [cid, widget] of peerWidgetsRef.current.entries()) {
+        const last = peerLastSeenRef.current.get(cid) || 0;
+        const idle = now - last > 3000;
+        const dom = widget.getDomNode();
+        dom.classList.toggle('peer-label-idle', idle);
+      }
+    };
+    idleTickRef.current = setInterval(tick, 500);
+
+    return () => {
+      awareness.off('change', onChange);
+      clearInterval(idleTickRef.current);
+      idleTickRef.current = null;
+      // Tear down all widgets + decorations on unmount.
+      for (const widget of peerWidgetsRef.current.values()) {
+        editor.removeContentWidget(widget);
+      }
+      peerWidgetsRef.current.clear();
+      for (const c of peerDecosRef.current.values()) c.clear();
+      peerDecosRef.current.clear();
+      for (const { timer } of peerLeavingRef.current.values()) clearTimeout(timer);
+      peerLeavingRef.current.clear();
+    };
+  }, [collab.awareness, activeId, editorReady]);
+
+  // Replit-style edit flashes: brief colored highlight on remote insertions
+  // into the file we're currently viewing.
+  useEffect(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const ytext = activeId ? getText(activeId) : null;
+    const awareness = collab.awareness;
+    if (!editor || !monaco || !ytext || !awareness || !editorReady) return;
+
+    const localClientId = awareness.clientID;
+
+    const onTextChange = (event, transaction) => {
+      if (transaction?.local) return;
+
+      // Attribute the change to whichever non-local peer's awareness cursor
+      // is on or near the affected line.
+      const model = editor.getModel?.();
+      if (!model) return;
+      let cursor = 0;
+      const ranges = [];
+      for (const delta of event.changes.delta || []) {
+        if (delta.retain != null) {
+          cursor += delta.retain;
+        } else if (typeof delta.insert === 'string') {
+          const start = model.getPositionAt(cursor);
+          const end = model.getPositionAt(cursor + delta.insert.length);
+          ranges.push(new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column));
+          cursor += delta.insert.length;
+        } else if (delta.delete != null) {
+          const pos = model.getPositionAt(cursor);
+          ranges.push(new monaco.Range(pos.lineNumber, 1, pos.lineNumber, model.getLineMaxColumn(pos.lineNumber)));
+        }
+      }
+      if (!ranges.length) return;
+
+      const states = Array.from(awareness.getStates().entries())
+        .filter(([cid]) => cid !== localClientId);
+      let peerId = states[0]?.[0];
+      const firstLine = ranges[0].startLineNumber;
+      for (const [cid, state] of states) {
+        const p = state?.presence;
+        if (p && p.fileId === activeId && Math.abs(p.headLine - firstLine) <= 1) {
+          peerId = cid;
+          break;
+        }
+      }
+      if (peerId == null) return;
+
+      const color = colorForClientId(peerId);
+      applyPeerColorVars(peerId, color, readableTextColor(color));
+
+      const decos = ranges.flatMap((r) => ([
+        { range: r, options: { inlineClassName: `peer-flash peer-flash-${peerId}` } },
+        {
+          range: new monaco.Range(r.startLineNumber, 1, r.endLineNumber, 1),
+          options: { isWholeLine: true, className: `peer-flash-line peer-flash-line-${peerId}` },
+        },
+      ]));
+
+      const collection = editor.createDecorationsCollection(decos);
+      const prev = flashHandlesRef.current.get(peerId);
+      if (prev?.timer) clearTimeout(prev.timer);
+      if (prev?.collection) prev.collection.clear();
+      const timer = setTimeout(() => collection.clear(), 1400);
+      flashHandlesRef.current.set(peerId, { collection, timer });
+    };
+
+    ytext.observe(onTextChange);
+    return () => {
+      ytext.unobserve(onTextChange);
+      for (const { collection, timer } of flashHandlesRef.current.values()) {
+        clearTimeout(timer);
+        collection.clear();
+      }
+      flashHandlesRef.current.clear();
+    };
+  }, [activeId, getText, collab.awareness, editorReady]);
 
   // ---------- Run dispatch ----------
   const runCode = useCallback(() => {
@@ -440,9 +890,16 @@ export default function Playground() {
     monacoRef.current = monaco;
     if (activeId) {
       const model = ensureModelAndBinding(activeId, LANG_META[lang].monacoLang);
-      if (model) editor.setModel(model);
+      if (model) {
+        editor.setModel(model);
+        bindingsRef.current.get(activeId)?.editors.add(editor);
+      }
     }
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCodeRef.current());
+    // Tell the rest of the component that Monaco has arrived. Effects keyed
+    // on this re-run, which is what guarantees the active file's model gets
+    // attached even when Monaco mounts after Yjs sync.
+    setEditorReady(true);
   };
 
   // ---------- Tab actions (write through Yjs) ----------
@@ -485,12 +942,29 @@ export default function Playground() {
   // ---------- Share ----------
   const onShare = async () => {
     const url = window.location.href;
-    try {
-      await navigator.clipboard.writeText(url);
-      setShareToast('Link copied');
-    } catch {
-      setShareToast(url);
+    let copied = false;
+    // Modern path: only works in secure contexts (https or localhost).
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(url);
+        copied = true;
+      } catch {}
     }
+    // Fallback for http://<lan-ip> dev servers and older browsers.
+    if (!copied) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = url;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        copied = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {}
+    }
+    setShareToast(copied ? 'Link copied' : 'Copy failed — copy manually');
     setTimeout(() => setShareToast(''), 1800);
   };
 
@@ -607,22 +1081,25 @@ export default function Playground() {
               }} />
               <span style={{ color: 'var(--text-muted)' }}>{collabLabel}</span>
               <div style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
-                {peers.slice(0, 6).map((p) => (
-                  <span
-                    key={p.clientId}
-                    title={p.name + (p.isLocal ? ' (you)' : '')}
-                    style={{
-                      width: 18, height: 18, borderRadius: '50%',
-                      background: p.color,
-                      color: '#fff',
-                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 10, fontWeight: 700,
-                      border: p.isLocal ? '2px solid var(--text)' : '2px solid var(--bg)',
-                    }}
-                  >
-                    {(p.name || '?').slice(0, 1).toUpperCase()}
-                  </span>
-                ))}
+                {peers.slice(0, 6).map((p) => {
+                  const peerColor = p.isLocal ? p.color : colorForClientId(p.clientId);
+                  return (
+                    <span
+                      key={p.clientId}
+                      title={p.name + (p.isLocal ? ' (you)' : '')}
+                      style={{
+                        width: 18, height: 18, borderRadius: '50%',
+                        background: peerColor,
+                        color: '#fff',
+                        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: 10, fontWeight: 700,
+                        border: p.isLocal ? '2px solid var(--text)' : '2px solid var(--bg)',
+                      }}
+                    >
+                      {(p.name || '?').slice(0, 1).toUpperCase()}
+                    </span>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -647,6 +1124,22 @@ export default function Playground() {
           {collabEnabled && (
             <button onClick={onShare} title="Copy room link">
               {shareToast || 'Share'}
+            </button>
+          )}
+
+          {collabEnabled && isHost && (
+            <button
+              onClick={() => {
+                if (window.confirm('End the session for everyone?')) endSession();
+              }}
+              title="End session for all peers"
+              style={{
+                background: 'transparent',
+                borderColor: 'var(--danger)',
+                color: 'var(--danger)',
+              }}
+            >
+              End session
             </button>
           )}
         </div>

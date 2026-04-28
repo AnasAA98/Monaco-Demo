@@ -172,3 +172,80 @@ kbd {
   background: var(--accent-glow);
   color: var(--text);
 }
+
+/* ============================================================
+   Remote presence: caret + selection + name label
+   ============================================================
+   Architecture:
+   - Selection background  → Monaco decoration (.peer-sel)
+   - Caret line            → Monaco decoration (.peer-caret)
+   - Floating name label   → Monaco content widget (.peer-label)
+   - Edit flash            → Monaco decoration (.peer-flash)
+   Per-peer color comes from a CSS custom property --peer-color set
+   on each element via inline style (no per-peer rules to inject). */
+
+.peer-sel {
+  background-color: var(--peer-color-soft, rgba(99, 102, 241, 0.22));
+  border-radius: 1px;
+  /* Sit below the local selection so user's own work always stays legible. */
+  z-index: 1;
+}
+
+.peer-caret {
+  position: relative;
+  width: 2px !important;
+  background: var(--peer-color, #6366f1);
+  box-shadow: 0 0 0 0.5px var(--peer-color, #6366f1);
+  border-radius: 1px;
+}
+
+/* The label is a content widget; Monaco wraps it in a positioned div so we
+   only have to style our inner element. */
+.peer-label {
+  display: inline-block;
+  position: relative;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+  padding: 2px 6px;
+  white-space: nowrap;
+  color: var(--peer-fg, #fff);
+  background: var(--peer-color, #6366f1);
+  /* Connected-to-caret look: sharp bottom-left, rounded elsewhere. */
+  border-radius: 3px 3px 3px 0;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  user-select: none;
+  /* Smooth fade for idle / disconnect. */
+  opacity: 1;
+  transition: opacity 250ms ease-out, transform 110ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  transform: translateY(-2px);
+}
+.peer-label.peer-label-below {
+  /* Used when caret is on line 1 — flip label below so it doesn't clip. */
+  border-radius: 0 3px 3px 3px;
+  transform: translateY(2px);
+}
+.peer-label.peer-label-idle {
+  opacity: 0;
+}
+.peer-label.peer-label-leaving {
+  opacity: 0;
+  transition: opacity 200ms ease-in;
+}
+/* Stack offset for the second / third peer on the same line. */
+.peer-label.peer-label-stack-1 { transform: translateY(-1.5em); }
+.peer-label.peer-label-stack-2 { transform: translateY(-3em); }
+.peer-label.peer-label-stack-1.peer-label-below { transform: translateY(1.5em); }
+.peer-label.peer-label-stack-2.peer-label-below { transform: translateY(3em); }
+
+/* Edit flash. */
+.peer-flash {
+  background-color: var(--peer-color-flash, rgba(99, 102, 241, 0.30));
+  transition: background-color 1.4s ease-out;
+}
+.peer-flash-line {
+  background-color: var(--peer-color-line, rgba(99, 102, 241, 0.08));
+}

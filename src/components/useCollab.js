@@ -52,19 +52,29 @@ function getServerUrl() {
   return `${wsProto}//${hostname}:1234`;
 }
 
-function seedIfEmpty(doc) {
-  for (const lang of ['python', 'javascript']) {
-    const tabs = doc.getArray(`tabs:${lang}`);
-    if (tabs.length === 0) {
-      const id = makeId();
-      const meta = new Y.Map();
-      meta.set('id', id);
-      meta.set('name', STARTERS[lang].name);
-      tabs.push([meta]);
-      const text = doc.getText(`file:${id}`);
-      if (text.length === 0) text.insert(0, STARTERS[lang].content);
+function seedIfEmpty(doc, ownClientId) {
+  let claimedHost = false;
+  doc.transact(() => {
+    const meta = doc.getMap('meta');
+    if (meta.get('creatorClientId') == null && ownClientId != null) {
+      meta.set('creatorClientId', ownClientId);
+      meta.set('createdAt', Date.now());
+      claimedHost = true;
     }
-  }
+    for (const lang of ['python', 'javascript']) {
+      const tabs = doc.getArray(`tabs:${lang}`);
+      if (tabs.length === 0) {
+        const id = makeId();
+        const tabMeta = new Y.Map();
+        tabMeta.set('id', id);
+        tabMeta.set('name', STARTERS[lang].name);
+        tabs.push([tabMeta]);
+        const text = doc.getText(`file:${id}`);
+        if (text.length === 0) text.insert(0, STARTERS[lang].content);
+      }
+    }
+  });
+  return claimedHost;
 }
 
 // ----- Solo (localStorage) backend ------------------------------------------
@@ -106,27 +116,39 @@ function useSoloStore() {
   if (!docRef.current) docRef.current = new Y.Doc();
   const [version, setVersion] = useState(0);
 
-  // Hydrate from localStorage on first mount (client only).
-  useEffect(() => {
+  const hydrate = () => {
     const doc = docRef.current;
-    let dirty = false;
-    for (const lang of ['python', 'javascript']) {
-      const arr = doc.getArray(`tabs:${lang}`);
-      if (arr.length > 0) continue;
-      const stored = readSolo(lang);
-      doc.transact(() => {
+    if (!doc) return;
+    doc.transact(() => {
+      for (const lang of ['python', 'javascript']) {
+        const arr = doc.getArray(`tabs:${lang}`);
+        // Drop existing entries (if any) so we can replace them with whatever
+        // localStorage now contains. Used both on first mount and after the
+        // host's snapshot at end-of-session.
+        const ids = arr.toArray().map((m) => m.get('id'));
+        if (arr.length) arr.delete(0, arr.length);
+        for (const id of ids) {
+          const t = doc.getText(`file:${id}`);
+          if (t.length) t.delete(0, t.length);
+        }
+        const stored = readSolo(lang);
         for (const f of stored) {
           const meta = new Y.Map();
           meta.set('id', f.id);
           meta.set('name', f.name);
           arr.push([meta]);
           const text = doc.getText(`file:${f.id}`);
-          if (text.length === 0 && f.content) text.insert(0, f.content);
+          if (f.content) text.insert(0, f.content);
         }
-      });
-      dirty = true;
-    }
-    if (dirty) setVersion((v) => v + 1);
+      }
+    });
+    setVersion((v) => v + 1);
+  };
+
+  // Hydrate from localStorage on first mount (client only).
+  useEffect(() => {
+    hydrate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Persist to localStorage on any change.
@@ -164,7 +186,7 @@ function useSoloStore() {
     };
   }, []);
 
-  return { doc: docRef.current, version };
+  return { doc: docRef.current, version, rehydrate: hydrate };
 }
 
 // ----- Yjs-over-WebSocket backend -------------------------------------------
@@ -175,6 +197,13 @@ function useYjsStore({ enabled, roomId, userName, userColor }) {
   const [status, setStatus] = useState('disconnected');
   const [version, setVersion] = useState(0);
   const [peers, setPeers] = useState([]);
+  const [meta, setMeta] = useState({ creatorClientId: null, terminated: false });
+
+  // Capture identity in a ref so name/color edits don't re-trigger the
+  // provider effect (which would tear down the WebSocket on every keystroke
+  // in the name input).
+  const identityRef = useRef({ userName, userColor });
+  identityRef.current = { userName, userColor };
 
   // Always make sure we have a Y.Doc when enabled, and tear it down when not.
   useEffect(() => {
@@ -216,7 +245,16 @@ function useYjsStore({ enabled, roomId, userName, userColor }) {
     provider.on('connection-close', onConnError);
 
     const onSync = (synced) => {
-      if (synced) seedIfEmpty(doc);
+      if (synced) {
+        seedIfEmpty(doc, provider.awareness.clientID);
+        // Refresh meta snapshot after the seed transaction in case we became
+        // host.
+        const m = doc.getMap('meta');
+        setMeta({
+          creatorClientId: m.get('creatorClientId') ?? null,
+          terminated: m.get('terminated') === true,
+        });
+      }
     };
     provider.on('sync', onSync);
 
@@ -226,8 +264,20 @@ function useYjsStore({ enabled, roomId, userName, userColor }) {
     tabsPy.observeDeep(bump);
     tabsJs.observeDeep(bump);
 
+    const metaMap = doc.getMap('meta');
+    const onMeta = () => {
+      setMeta({
+        creatorClientId: metaMap.get('creatorClientId') ?? null,
+        terminated: metaMap.get('terminated') === true,
+      });
+    };
+    metaMap.observe(onMeta);
+
     const awareness = provider.awareness;
-    awareness.setLocalStateField('user', { name: userName, color: userColor });
+    awareness.setLocalStateField('user', {
+      name: identityRef.current.userName,
+      color: identityRef.current.userColor,
+    });
 
     const onAwareness = () => {
       const states = Array.from(awareness.getStates().entries()).map(
@@ -246,6 +296,7 @@ function useYjsStore({ enabled, roomId, userName, userColor }) {
     return () => {
       tabsPy.unobserveDeep(bump);
       tabsJs.unobserveDeep(bump);
+      metaMap.unobserve(onMeta);
       awareness.off('change', onAwareness);
       provider.off('status', onStatus);
       provider.off('connection-error', onConnError);
@@ -255,8 +306,13 @@ function useYjsStore({ enabled, roomId, userName, userColor }) {
       providerRef.current = null;
       doc.destroy();
       docRef.current = null;
+      setMeta({ creatorClientId: null, terminated: false });
     };
-  }, [enabled, roomId, userName, userColor]);
+    // identity (userName/userColor) is intentionally NOT a dep — see the
+    // separate effect below that pushes identity changes through awareness
+    // without rebuilding the provider.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, roomId]);
 
   return {
     doc: docRef.current,
@@ -264,6 +320,7 @@ function useYjsStore({ enabled, roomId, userName, userColor }) {
     status,
     peers,
     version,
+    meta,
   };
 }
 
@@ -336,14 +393,52 @@ export function useCollab({ enabled, roomId, userName, userColor }) {
     provider.awareness.setLocalStateField('user', { name: userName, color: userColor });
   }, [enabled, yjs.provider, userName, userColor]);
 
+  const provider = enabled ? yjs.provider : null;
+  const awareness = provider?.awareness ?? null;
+  const localClientId = awareness?.clientID ?? null;
+  const meta = enabled ? yjs.meta : { creatorClientId: null, terminated: false };
+  const isHost =
+    enabled && meta.creatorClientId != null && meta.creatorClientId === localClientId;
+
+  const endSession = () => {
+    if (!enabled || !doc) return;
+    if (!isHost) return;
+    // Before flipping the terminated flag, snapshot every shared file's
+    // current content into the host's solo localStorage and rehydrate the
+    // solo Y.Doc so when collab drops the host keeps editing the same files.
+    // Non-host peers never run this code, so their solo storage stays
+    // whatever it was before they joined the session.
+    try {
+      for (const lang of ['python', 'javascript']) {
+        const arr = doc.getArray(`tabs:${lang}`);
+        const out = arr.toArray().map((m) => ({
+          id: m.get('id'),
+          name: m.get('name'),
+          content: doc.getText(`file:${m.get('id')}`).toString(),
+        }));
+        if (out.length) writeSolo(lang, out);
+      }
+      solo.rehydrate();
+    } catch {}
+    doc.transact(() => {
+      const m = doc.getMap('meta');
+      m.set('terminated', true);
+      m.set('terminatedAt', Date.now());
+    });
+  };
+
   return {
     enabled,
     doc,
-    provider: enabled ? yjs.provider : null,
-    awareness: enabled ? yjs.provider?.awareness ?? null : null,
+    provider,
+    awareness,
     status: enabled ? yjs.status : 'solo',
     peers: enabled ? yjs.peers : [],
     version,
+    meta,
+    isHost,
+    terminated: !!meta.terminated,
+    endSession,
     ...api,
   };
 }
