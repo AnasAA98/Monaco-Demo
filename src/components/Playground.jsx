@@ -1,53 +1,36 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
+import { MonacoBinding } from 'y-monaco';
 import s from './ide.module.css';
+import { useCollab } from './useCollab';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
 
 const TIME_LIMIT_MS = 10000;
 
 const STORAGE_KEYS = {
-  python: 'monaco-py-files-v1',
-  javascript: 'monaco-js-files-v1',
   lang: 'monaco-active-lang-v1',
-};
-
-const STARTERS = {
-  python: [
-    {
-      name: 'main.py',
-      content: `# Welcome to the Python IDE
-# Press Cmd/Ctrl + Enter to run.
-
-def greet(name):
-    return f"Hello, {name}!"
-
-print(greet("Monaco"))
-`,
-    },
-  ],
-  javascript: [
-    {
-      name: 'main.js',
-      content: `// Welcome to the JavaScript IDE
-// Press Cmd/Ctrl + Enter to run.
-
-function fib(n) {
-  return n < 2 ? n : fib(n - 1) + fib(n - 2);
-}
-
-console.log("fib(10) =", fib(10));
-`,
-    },
-  ],
+  name: 'monaco-collab-name-v1',
+  color: 'monaco-collab-color-v1',
+  collabEnabled: 'monaco-collab-enabled-v1',
 };
 
 const LANG_META = {
   python: { label: 'Python', short: 'Py', monacoLang: 'python', tabSize: 4, ext: '.py' },
   javascript: { label: 'JavaScript', short: 'JS', monacoLang: 'javascript', tabSize: 2, ext: '.js' },
 };
+
+const PEER_COLORS = [
+  '#6366f1', '#10b981', '#f59e0b', '#f43f5e', '#3b82f6',
+  '#a855f7', '#ec4899', '#14b8a6', '#eab308', '#84cc16',
+];
+
+const ANIMAL_NAMES = [
+  'Otter', 'Falcon', 'Panda', 'Koala', 'Heron',
+  'Lynx', 'Badger', 'Sparrow', 'Newt', 'Wombat',
+];
 
 const SANDBOX_HTML = `<!doctype html>
 <html><head><meta charset="utf-8" /></head><body>
@@ -92,8 +75,6 @@ const SANDBOX_HTML = `<!doctype html>
       done();
     }
   });
-  // Tell the parent we're alive. Send once immediately, then again on
-  // window 'load' in case the parent listener wasn't attached yet.
   function ping() { parent.postMessage({ __js_ide: true, level: 'ready' }, '*'); }
   ping();
   window.addEventListener('load', ping);
@@ -101,18 +82,7 @@ const SANDBOX_HTML = `<!doctype html>
 </script>
 </body></html>`;
 
-function loadFiles(lang) {
-  if (typeof window === 'undefined') return STARTERS[lang];
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEYS[lang]);
-    if (!raw) return STARTERS[lang];
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-  } catch {}
-  return STARTERS[lang];
-}
-
-function loadLang() {
+function readLangPref() {
   if (typeof window === 'undefined') return 'python';
   try {
     const raw = window.localStorage.getItem(STORAGE_KEYS.lang);
@@ -121,14 +91,63 @@ function loadLang() {
   return 'python';
 }
 
+function readIdentity() {
+  if (typeof window === 'undefined') {
+    return { name: 'Guest', color: PEER_COLORS[0] };
+  }
+  let name = '';
+  let color = '';
+  try {
+    name = window.localStorage.getItem(STORAGE_KEYS.name) || '';
+    color = window.localStorage.getItem(STORAGE_KEYS.color) || '';
+  } catch {}
+  if (!name) {
+    name = ANIMAL_NAMES[Math.floor(Math.random() * ANIMAL_NAMES.length)];
+  }
+  if (!color) {
+    color = PEER_COLORS[Math.floor(Math.random() * PEER_COLORS.length)];
+  }
+  return { name, color };
+}
+
+function getOrCreateRoomId({ updateUrl }) {
+  if (typeof window === 'undefined') return 'default';
+  const params = new URLSearchParams(window.location.search);
+  let room = params.get('room');
+  if (!room) {
+    room = Math.random().toString(36).slice(2, 8);
+    if (updateUrl) {
+      params.set('room', room);
+      const next = `${window.location.pathname}?${params.toString()}`;
+      window.history.replaceState({}, '', next);
+    }
+  }
+  return room;
+}
+
+function readCollabEnabled() {
+  if (typeof window === 'undefined') return false;
+  try {
+    if (window.localStorage.getItem(STORAGE_KEYS.collabEnabled) === '1') return true;
+  } catch {}
+  // If the URL already has ?room=... treat the user as opting in to collab
+  // (e.g. they followed someone else's share link).
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('room')) return true;
+  } catch {}
+  return false;
+}
+
 export default function Playground() {
-  // Per-language file state
-  const [pyFiles, setPyFiles] = useState(STARTERS.python);
-  const [jsFiles, setJsFiles] = useState(STARTERS.javascript);
-  const [pyActive, setPyActive] = useState(STARTERS.python[0].name);
-  const [jsActive, setJsActive] = useState(STARTERS.javascript[0].name);
+  // Identity / room
+  const [roomId, setRoomId] = useState('default');
+  const [userName, setUserName] = useState('Guest');
+  const [userColor, setUserColor] = useState(PEER_COLORS[0]);
   const [lang, setLang] = useState('python');
   const [hydrated, setHydrated] = useState(false);
+  const [shareToast, setShareToast] = useState('');
+  const [collabEnabled, setCollabEnabled] = useState(false);
 
   // UI state
   const [output, setOutput] = useState('');
@@ -136,54 +155,97 @@ export default function Playground() {
   const [pyReady, setPyReady] = useState(false);
   const [jsReady, setJsReady] = useState(false);
 
+  // Per-language active file id
+  const [pyActive, setPyActive] = useState(null);
+  const [jsActive, setJsActive] = useState(null);
+
   // Refs
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
-  const modelsRef = useRef(new Map()); // key: `${lang}:${name}` -> ITextModel
+  const modelsRef = useRef(new Map());   // id -> ITextModel
+  const bindingsRef = useRef(new Map()); // id -> MonacoBinding
   const workerRef = useRef(null);
   const timerRef = useRef(null);
   const busyRef = useRef(false);
   const iframeRef = useRef(null);
   const runIdRef = useRef(0);
 
-  // Hydrate from localStorage on mount
+  // Hydrate identity / room on mount (client only)
   useEffect(() => {
-    const py = loadFiles('python');
-    const js = loadFiles('javascript');
-    const initialLang = loadLang();
-    setPyFiles(py);
-    setJsFiles(js);
-    setPyActive(py[0].name);
-    setJsActive(js[0].name);
-    setLang(initialLang);
+    const collabOn = readCollabEnabled();
+    setCollabEnabled(collabOn);
+    setRoomId(getOrCreateRoomId({ updateUrl: collabOn }));
+    const id = readIdentity();
+    setUserName(id.name);
+    setUserColor(id.color);
+    setLang(readLangPref());
     setHydrated(true);
   }, []);
 
   useEffect(() => {
     if (!hydrated) return;
-    try { window.localStorage.setItem(STORAGE_KEYS.python, JSON.stringify(pyFiles)); } catch {}
-  }, [pyFiles, hydrated]);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    try { window.localStorage.setItem(STORAGE_KEYS.javascript, JSON.stringify(jsFiles)); } catch {}
-  }, [jsFiles, hydrated]);
+    try {
+      window.localStorage.setItem(STORAGE_KEYS.collabEnabled, collabEnabled ? '1' : '0');
+    } catch {}
+    if (collabEnabled) {
+      // Now that collab is on, make sure the URL reflects the room id so the
+      // user can copy it.
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('room') !== roomId) {
+        params.set('room', roomId);
+        const next = `${window.location.pathname}?${params.toString()}`;
+        window.history.replaceState({}, '', next);
+      }
+    } else {
+      // Drop ?room=... from the URL when collab is off.
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('room')) {
+        params.delete('room');
+        const search = params.toString();
+        const next = `${window.location.pathname}${search ? '?' + search : ''}`;
+        window.history.replaceState({}, '', next);
+      }
+    }
+  }, [collabEnabled, roomId, hydrated]);
 
   useEffect(() => {
     if (!hydrated) return;
     try { window.localStorage.setItem(STORAGE_KEYS.lang, lang); } catch {}
   }, [lang, hydrated]);
 
-  // Helpers to read/write the active language's files
-  const files = lang === 'python' ? pyFiles : jsFiles;
-  const setFiles = lang === 'python' ? setPyFiles : setJsFiles;
-  const activeFile = lang === 'python' ? pyActive : jsActive;
-  const setActiveFile = lang === 'python' ? setPyActive : setJsActive;
+  useEffect(() => {
+    if (!hydrated) return;
+    try { window.localStorage.setItem(STORAGE_KEYS.name, userName); } catch {}
+  }, [userName, hydrated]);
 
-  const appendOutput = useCallback((text) => {
-    setOutput((o) => o + text);
-  }, []);
+  useEffect(() => {
+    if (!hydrated) return;
+    try { window.localStorage.setItem(STORAGE_KEYS.color, userColor); } catch {}
+  }, [userColor, hydrated]);
 
+  const collab = useCollab({ enabled: collabEnabled, roomId, userName, userColor });
+  const { status, peers, version, getTabs, addTab, renameTab, closeTab, getText } = collab;
+
+  // Snapshot tabs for the current language; recomputed when the underlying
+  // store (Yjs in collab mode, local Y.Doc in solo mode) notifies us.
+  const pyTabs = useMemo(() => getTabs('python'), [getTabs, version]);
+  const jsTabs = useMemo(() => getTabs('javascript'), [getTabs, version]);
+  const tabs = lang === 'python' ? pyTabs : jsTabs;
+  const activeId = lang === 'python' ? pyActive : jsActive;
+  const setActiveId = lang === 'python' ? setPyActive : setJsActive;
+
+  // Keep the active id valid as the tab list shifts (other peers add/close).
+  useEffect(() => {
+    if (!tabs.length) {
+      if (activeId !== null) setActiveId(null);
+      return;
+    }
+    if (!tabs.find((t) => t.id === activeId)) {
+      setActiveId(tabs[0].id);
+    }
+  }, [tabs, activeId, setActiveId]);
+
+  const appendOutput = useCallback((text) => setOutput((o) => o + text), []);
   const cleanupRun = useCallback(() => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
@@ -199,13 +261,9 @@ export default function Playground() {
     worker.onmessage = (e) => {
       const { type, msg, result, error, elapsed } = e.data;
       switch (type) {
-        case 'ready':
-          setPyReady(true);
-          break;
+        case 'ready': setPyReady(true); break;
         case 'stdout':
-        case 'stderr':
-          appendOutput(msg);
-          break;
+        case 'stderr': appendOutput(msg); break;
         case 'done':
           if (result) appendOutput(result + '\n');
           appendOutput(`\n✔ Finished in ${elapsed} ms\n`);
@@ -215,8 +273,7 @@ export default function Playground() {
           appendOutput('✖ ' + error + '\n');
           cleanupRun();
           break;
-        default:
-          break;
+        default: break;
       }
     };
     workerRef.current = worker;
@@ -236,10 +293,7 @@ export default function Playground() {
     const onMsg = (e) => {
       const data = e.data;
       if (!data || data.__js_ide !== true) return;
-      if (data.level === 'ready') {
-        setJsReady(true);
-        return;
-      }
+      if (data.level === 'ready') { setJsReady(true); return; }
       if (data.level === 'done') {
         appendOutput('\n✔ Done\n');
         cleanupRun();
@@ -249,8 +303,6 @@ export default function Playground() {
       appendOutput(prefix + data.msg + '\n');
     };
     window.addEventListener('message', onMsg);
-    // Fallback: if no ready signal arrives within 2s, assume the sandbox is up.
-    // (Hidden iframes with srcDoc occasionally swallow the load event.)
     const fallback = setTimeout(() => setJsReady(true), 2000);
     return () => {
       window.removeEventListener('message', onMsg);
@@ -258,49 +310,107 @@ export default function Playground() {
     };
   }, [appendOutput, cleanupRun]);
 
-  // ---------- Monaco models ----------
-  const getModel = useCallback((langKey, name, content) => {
-    const monaco = monacoRef.current;
-    if (!monaco) return null;
-    const key = `${langKey}:${name}`;
-    const existing = modelsRef.current.get(key);
-    if (existing) return existing;
-    const uri = monaco.Uri.parse(`inmemory://${langKey}/${encodeURIComponent(name)}`);
-    const model = monaco.editor.createModel(content, LANG_META[langKey].monacoLang, uri);
-    model.onDidChangeContent(() => {
-      const value = model.getValue();
-      const setter = langKey === 'python' ? setPyFiles : setJsFiles;
-      setter((prev) => prev.map((f) => (f.name === name ? { ...f, content: value } : f)));
-    });
-    modelsRef.current.set(key, model);
-    return model;
-  }, []);
+  // ---------- Monaco models bound to Y.Text ----------
+  const docKey = collab.doc; // identity changes when we switch modes
+  const ensureModelAndBinding = useCallback(
+    (id, monacoLang) => {
+      const monaco = monacoRef.current;
+      if (!monaco) return null;
+      const ytext = getText(id);
+      if (!ytext) return null;
 
-  // Switch model when active file or language changes
+      let model = modelsRef.current.get(id);
+      if (!model) {
+        const uri = monaco.Uri.parse(`inmemory://collab/${id}`);
+        model = monaco.editor.createModel('', monacoLang, uri);
+        modelsRef.current.set(id, model);
+      }
+      const existing = bindingsRef.current.get(id);
+      if (existing && existing.__doc !== docKey) {
+        existing.destroy();
+        bindingsRef.current.delete(id);
+      }
+      if (!bindingsRef.current.has(id)) {
+        const binding = new MonacoBinding(
+          ytext,
+          model,
+          new Set(),
+          collab.awareness ?? null
+        );
+        binding.__doc = docKey;
+        bindingsRef.current.set(id, binding);
+      } else {
+        const binding = bindingsRef.current.get(id);
+        if (editorRef.current) binding.editors.add(editorRef.current);
+      }
+      return model;
+    },
+    [getText, collab.awareness, docKey]
+  );
+
+  // Switch the editor to the active file's model + binding.
   useEffect(() => {
     const editor = editorRef.current;
-    if (!editor || !monacoRef.current) return;
-    const file = files.find((f) => f.name === activeFile);
-    if (!file) return;
-    const model = getModel(lang, file.name, file.content);
-    if (model && editor.getModel() !== model) {
+    if (!editor || !monacoRef.current || !activeId) return;
+    const monacoLang = LANG_META[lang].monacoLang;
+    const model = ensureModelAndBinding(activeId, monacoLang);
+    if (!model) return;
+    if (editor.getModel() !== model) {
+      // Detach the editor from any previously bound model so its remote-cursor
+      // decorations stop targeting the old buffer.
+      bindingsRef.current.forEach((b, id) => {
+        if (id !== activeId) b.editors.delete(editor);
+      });
       editor.setModel(model);
+      bindingsRef.current.get(activeId)?.editors.add(editor);
       editor.focus();
     }
-  }, [lang, activeFile, files, getModel]);
+  }, [lang, activeId, ensureModelAndBinding]);
+
+  // Dispose models + bindings for files that were removed by any peer.
+  useEffect(() => {
+    const liveIds = new Set([...pyTabs, ...jsTabs].map((t) => t.id));
+    for (const [id, binding] of bindingsRef.current.entries()) {
+      if (!liveIds.has(id)) {
+        binding.destroy();
+        bindingsRef.current.delete(id);
+      }
+    }
+    for (const [id, model] of modelsRef.current.entries()) {
+      if (!liveIds.has(id)) {
+        model.dispose();
+        modelsRef.current.delete(id);
+      }
+    }
+  }, [pyTabs, jsTabs]);
+
+  // When the underlying doc swaps (collab toggled on/off), tear down every
+  // binding so the next render re-binds against the new doc's Y.Text.
+  useEffect(() => {
+    for (const binding of bindingsRef.current.values()) binding.destroy();
+    bindingsRef.current.clear();
+    for (const model of modelsRef.current.values()) model.dispose();
+    modelsRef.current.clear();
+    // Force the active-id effect to re-run by nudging both ids; the sanity
+    // effect will reconcile to the first available tab.
+    setPyActive(null);
+    setJsActive(null);
+  }, [docKey]);
 
   // ---------- Run dispatch ----------
   const runCode = useCallback(() => {
     if (busyRef.current) return;
-    const file = files.find((f) => f.name === activeFile);
-    const code = file?.content ?? '';
+    if (!activeId) return;
+    const tab = tabs.find((t) => t.id === activeId);
+    if (!tab) return;
+    const code = getText(activeId).toString();
     if (!code.trim()) return;
 
     if (lang === 'python') {
       if (!pyReady) return;
       busyRef.current = true;
       setBusy(true);
-      setOutput(`▶ Running ${activeFile}…\n\n`);
+      setOutput(`▶ Running ${tab.name}…\n\n`);
       timerRef.current = setTimeout(() => {
         workerRef.current?.terminate();
         setPyReady(false);
@@ -313,91 +423,102 @@ export default function Playground() {
       if (!jsReady) return;
       busyRef.current = true;
       setBusy(true);
-      setOutput(`▶ Running ${activeFile}…\n\n`);
+      setOutput(`▶ Running ${tab.name}…\n\n`);
       const runId = ++runIdRef.current;
       iframeRef.current?.contentWindow?.postMessage(
         { __js_ide_run: true, code, runId },
         '*'
       );
     }
-  }, [files, activeFile, lang, pyReady, jsReady, appendOutput, cleanupRun, spawnWorker]);
+  }, [activeId, tabs, lang, pyReady, jsReady, getText, appendOutput, cleanupRun, spawnWorker]);
 
   const runCodeRef = useRef(runCode);
-  useEffect(() => {
-    runCodeRef.current = runCode;
-  }, [runCode]);
+  useEffect(() => { runCodeRef.current = runCode; }, [runCode]);
 
   const handleEditorMount = (editor, monaco) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
-    const file = files.find((f) => f.name === activeFile) ?? files[0];
-    const model = getModel(lang, file.name, file.content);
-    if (model) editor.setModel(model);
+    if (activeId) {
+      const model = ensureModelAndBinding(activeId, LANG_META[lang].monacoLang);
+      if (model) editor.setModel(model);
+    }
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCodeRef.current());
   };
 
-  // ---------- Tab actions (operate on active language) ----------
-  const addFile = () => {
+  // ---------- Tab actions (write through Yjs) ----------
+  const onAddFile = () => {
     const ext = LANG_META[lang].ext;
-    const base = 'untitled';
+    const taken = new Set(tabs.map((t) => t.name));
     let n = 1;
-    let name = `${base}${ext}`;
-    const taken = new Set(files.map((f) => f.name));
+    let name = `untitled${ext}`;
     while (taken.has(name)) {
       n += 1;
-      name = `${base}${n}${ext}`;
+      name = `untitled${n}${ext}`;
     }
-    setFiles((prev) => [...prev, { name, content: '' }]);
-    setActiveFile(name);
+    const id = addTab(lang, name);
+    setActiveId(id);
   };
 
-  const closeFile = (name) => {
-    if (files.length === 1) return;
-    const key = `${lang}:${name}`;
-    const model = modelsRef.current.get(key);
-    if (model) {
-      model.dispose();
-      modelsRef.current.delete(key);
-    }
-    const idx = files.findIndex((f) => f.name === name);
-    const next = files.filter((f) => f.name !== name);
-    setFiles(next);
-    if (activeFile === name) {
+  const onCloseFile = (id) => {
+    if (tabs.length === 1) return;
+    closeTab(lang, id);
+    if (activeId === id) {
+      const idx = tabs.findIndex((t) => t.id === id);
+      const next = tabs.filter((t) => t.id !== id);
       const fallback = next[Math.max(0, idx - 1)];
-      setActiveFile(fallback.name);
+      if (fallback) setActiveId(fallback.id);
     }
   };
 
-  const renameFile = (oldName) => {
+  const onRenameFile = (id, oldName) => {
     const input = window.prompt('Rename file', oldName);
     if (!input) return;
     const newName = input.trim();
     if (!newName || newName === oldName) return;
-    if (files.some((f) => f.name === newName)) {
+    if (tabs.some((t) => t.name === newName)) {
       window.alert(`A file named "${newName}" already exists.`);
       return;
     }
-    const key = `${lang}:${oldName}`;
-    const oldModel = modelsRef.current.get(key);
-    const content = oldModel
-      ? oldModel.getValue()
-      : files.find((f) => f.name === oldName)?.content ?? '';
-    if (oldModel) {
-      oldModel.dispose();
-      modelsRef.current.delete(key);
+    renameTab(lang, id, newName);
+  };
+
+  // ---------- Share ----------
+  const onShare = async () => {
+    const url = window.location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+      setShareToast('Link copied');
+    } catch {
+      setShareToast(url);
     }
-    setFiles((prev) =>
-      prev.map((f) => (f.name === oldName ? { ...f, name: newName, content } : f))
-    );
-    if (activeFile === oldName) setActiveFile(newName);
+    setTimeout(() => setShareToast(''), 1800);
+  };
+
+  const onNameChange = (e) => {
+    const next = e.target.value.slice(0, 24);
+    setUserName(next);
   };
 
   // ---------- Status ----------
   const ready = lang === 'python' ? pyReady : jsReady;
-  const statusLabel = !ready
+  const runtimeLabel = !ready
     ? lang === 'python' ? 'Loading Pyodide' : 'Initializing'
     : busy ? 'Running' : 'Ready';
-  const statusColor = !ready ? 'var(--warning)' : busy ? 'var(--accent)' : 'var(--success)';
+  const runtimeColor = !ready ? 'var(--warning)' : busy ? 'var(--accent)' : 'var(--success)';
+
+  const collabColor = !collabEnabled
+    ? 'var(--text-faint)'
+    : status === 'connected' ? 'var(--success)'
+    : status === 'connecting' ? 'var(--warning)'
+    : 'var(--danger)';
+  const collabLabel = !collabEnabled
+    ? 'Solo'
+    : status === 'connected' ? `Live · ${peers.length} ${peers.length === 1 ? 'user' : 'users'}`
+    : status === 'connecting' ? 'Connecting…'
+    : 'Offline';
+
+  const activeTab = tabs.find((t) => t.id === activeId);
+  const activeName = activeTab?.name ?? '';
 
   return (
     <div className={s.shell}>
@@ -409,25 +530,125 @@ export default function Playground() {
             {lang === 'python' ? 'Pyodide · Web Worker' : 'Sandboxed iframe'}
           </span>
         </div>
-        <div className={s.langToggle} role="tablist" aria-label="Language">
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+          <div className={s.langToggle} role="tablist" aria-label="Language">
+            <button
+              role="tab"
+              aria-selected={lang === 'python'}
+              className={`${s.langOption} ${lang === 'python' ? s.langOptionActive : ''}`}
+              onClick={() => !busy && setLang('python')}
+              disabled={busy}
+            >
+              Python
+            </button>
+            <button
+              role="tab"
+              aria-selected={lang === 'javascript'}
+              className={`${s.langOption} ${lang === 'javascript' ? s.langOptionActive : ''}`}
+              onClick={() => !busy && setLang('javascript')}
+              disabled={busy}
+            >
+              JavaScript
+            </button>
+          </div>
+
           <button
-            role="tab"
-            aria-selected={lang === 'python'}
-            className={`${s.langOption} ${lang === 'python' ? s.langOptionActive : ''}`}
-            onClick={() => !busy && setLang('python')}
-            disabled={busy}
+            onClick={() => setCollabEnabled((v) => !v)}
+            title={collabEnabled ? 'Stop collaborating' : 'Start collaborating'}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.45rem',
+              padding: '0.4rem 0.75rem',
+              background: collabEnabled ? 'var(--bg-active)' : 'var(--bg)',
+              border: `1px solid ${collabEnabled ? 'var(--accent)' : 'var(--border)'}`,
+              borderRadius: 'var(--r-md)',
+              color: 'var(--text)',
+              fontSize: '0.85rem',
+              fontWeight: 500,
+            }}
           >
-            Python
+            <span
+              aria-hidden
+              style={{
+                width: 26, height: 14, borderRadius: 8, padding: 2,
+                background: collabEnabled ? 'var(--accent)' : 'var(--border-strong)',
+                display: 'inline-flex',
+                justifyContent: collabEnabled ? 'flex-end' : 'flex-start',
+                transition: 'background 140ms ease, justify-content 140ms ease',
+              }}
+            >
+              <span style={{
+                width: 10, height: 10, borderRadius: '50%',
+                background: '#fff',
+              }} />
+            </span>
+            <span>Collaborate</span>
           </button>
-          <button
-            role="tab"
-            aria-selected={lang === 'javascript'}
-            className={`${s.langOption} ${lang === 'javascript' ? s.langOptionActive : ''}`}
-            onClick={() => !busy && setLang('javascript')}
-            disabled={busy}
-          >
-            JavaScript
-          </button>
+
+          {collabEnabled && (
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                padding: '0.25rem 0.6rem',
+                background: 'var(--bg)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--r-md)',
+                fontSize: '0.85rem',
+              }}
+              title="Other people in this room"
+            >
+              <span style={{
+                width: 7, height: 7, borderRadius: '50%',
+                background: collabColor, display: 'inline-block',
+              }} />
+              <span style={{ color: 'var(--text-muted)' }}>{collabLabel}</span>
+              <div style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
+                {peers.slice(0, 6).map((p) => (
+                  <span
+                    key={p.clientId}
+                    title={p.name + (p.isLocal ? ' (you)' : '')}
+                    style={{
+                      width: 18, height: 18, borderRadius: '50%',
+                      background: p.color,
+                      color: '#fff',
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: 10, fontWeight: 700,
+                      border: p.isLocal ? '2px solid var(--text)' : '2px solid var(--bg)',
+                    }}
+                  >
+                    {(p.name || '?').slice(0, 1).toUpperCase()}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {collabEnabled && (
+            <input
+              value={userName}
+              onChange={onNameChange}
+              placeholder="Your name"
+              style={{
+                width: 110,
+                padding: '0.35rem 0.6rem',
+                background: 'var(--bg)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--r-sm)',
+                color: 'var(--text)',
+                fontSize: '0.85rem',
+              }}
+            />
+          )}
+
+          {collabEnabled && (
+            <button onClick={onShare} title="Copy room link">
+              {shareToast || 'Share'}
+            </button>
+          )}
         </div>
       </header>
 
@@ -435,24 +656,21 @@ export default function Playground() {
         <section className={`${s.pane} ${s.paneEditor}`}>
           <div className={s.tabs}>
             <div className={s.tablist} role="tablist">
-              {files.map((f) => (
+              {tabs.map((t) => (
                 <div
-                  key={f.name}
+                  key={t.id}
                   role="tab"
-                  aria-selected={f.name === activeFile}
-                  className={`${s.tab} ${f.name === activeFile ? s.tabActive : ''}`}
-                  onClick={() => setActiveFile(f.name)}
-                  onDoubleClick={() => renameFile(f.name)}
+                  aria-selected={t.id === activeId}
+                  className={`${s.tab} ${t.id === activeId ? s.tabActive : ''}`}
+                  onClick={() => setActiveId(t.id)}
+                  onDoubleClick={() => onRenameFile(t.id, t.name)}
                   title="Click to switch · Double-click to rename"
                 >
-                  <span>{f.name}</span>
-                  {files.length > 1 && (
+                  <span>{t.name}</span>
+                  {tabs.length > 1 && (
                     <span
                       className={s.tabClose}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        closeFile(f.name);
-                      }}
+                      onClick={(e) => { e.stopPropagation(); onCloseFile(t.id); }}
                       title="Close file"
                     >
                       ×
@@ -460,13 +678,9 @@ export default function Playground() {
                   )}
                 </div>
               ))}
-              <button className={s.tabAdd} onClick={addFile} title="New file">
-                +
-              </button>
+              <button className={s.tabAdd} onClick={onAddFile} title="New file">+</button>
             </div>
-            <span className={s.hint}>
-              <kbd>⌘</kbd> <kbd>↵</kbd> run
-            </span>
+            <span className={s.hint}><kbd>⌘</kbd> <kbd>↵</kbd> run</span>
           </div>
           <div className={s.editor}>
             <MonacoEditor
@@ -499,28 +713,37 @@ export default function Playground() {
             <div className={s.actions}>
               <button
                 className="primary"
-                disabled={busy || !ready}
+                disabled={busy || !ready || !activeId}
                 onClick={runCode}
                 title="Run active file (⌘/Ctrl + Enter)"
               >
-                {busy ? 'Running…' : !ready ? 'Loading…' : `▶ Run ${activeFile}`}
+                {busy ? 'Running…' : !ready ? 'Loading…' : `▶ Run ${activeName || ''}`}
               </button>
-              <button onClick={() => setOutput('')} disabled={busy}>
-                Clear
-              </button>
+              <button onClick={() => setOutput('')} disabled={busy}>Clear</button>
             </div>
           </div>
           <pre className={`${s.console} ${output ? '' : s.consoleEmpty}`}>
             {output ||
-              `Welcome. Toggle languages above, write code, and press ⌘/Ctrl + Enter to run.`}
+              (collabEnabled
+                ? `Welcome. Toggle languages above, write code, and press ⌘/Ctrl + Enter to run.\nCollaboration is on — share the URL and every keystroke syncs through the Yjs server.`
+                : `Welcome. Toggle languages above, write code, and press ⌘/Ctrl + Enter to run.\nClick "Collaborate" in the header to enable real-time sharing.`)}
           </pre>
           <div className={s.statusbar}>
-            <span className={s.statusDot} style={{ background: statusColor }} />
-            <span>{statusLabel}</span>
+            <span className={s.statusDot} style={{ background: runtimeColor }} />
+            <span>{runtimeLabel}</span>
+            <span className={s.dot}>·</span>
+            <span style={{ color: collabColor }}>●</span>
+            <span>{collabLabel}</span>
             <span className={s.spacer} />
             <span>{LANG_META[lang].label}</span>
             <span className={s.dot}>·</span>
-            <span>{files.length} file{files.length === 1 ? '' : 's'}</span>
+            <span>{tabs.length} file{tabs.length === 1 ? '' : 's'}</span>
+            {collabEnabled && (
+              <>
+                <span className={s.dot}>·</span>
+                <span>room {roomId}</span>
+              </>
+            )}
             {lang === 'python' && (
               <>
                 <span className={s.dot}>·</span>
@@ -531,7 +754,6 @@ export default function Playground() {
         </section>
       </div>
 
-      {/* Always-mounted JS sandbox; reused across runs */}
       <iframe
         ref={iframeRef}
         title="js-sandbox"
